@@ -26,6 +26,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      KERNEL_DIR: ${{ github.workspace }}/android-kernel
+      OUT_DIR: ${{ github.workspace }}/android-kernel/out
 
     steps:
       - name: Checkout build repo
@@ -52,15 +55,29 @@ jobs:
           git clone --depth=1 \
             -b ${{ github.event.inputs.kernel_branch }} \
             ${{ github.event.inputs.kernel_source }} \
-            android-kernel
-          ls android-kernel/
+            ${{ env.KERNEL_DIR }}
+          ls ${{ env.KERNEL_DIR }}/
+
+      - name: Fix kernel script permissions
+        run: |
+          echo "Fixing execute permissions on kernel scripts..."
+          find ${{ env.KERNEL_DIR }}/scripts -type f -name "*.sh" -exec chmod +x {} \;
+          chmod +x ${{ env.KERNEL_DIR }}/scripts/clang-android.sh 2>/dev/null || true
+          chmod +x ${{ env.KERNEL_DIR }}/scripts/gcc-version.sh 2>/dev/null || true
+          chmod +x ${{ env.KERNEL_DIR }}/scripts/clang-version.sh 2>/dev/null || true
+          chmod +x ${{ env.KERNEL_DIR }}/scripts/lld-version.sh 2>/dev/null || true
+          chmod +x ${{ env.KERNEL_DIR }}/scripts/gcc-plugin.sh 2>/dev/null || true
+          chmod +x ${{ env.KERNEL_DIR }}/scripts/link-vmlinux.sh 2>/dev/null || true
+          chmod +x ${{ env.KERNEL_DIR }}/scripts/mkcompile_h 2>/dev/null || true
+          find ${{ env.KERNEL_DIR }}/scripts -type f ! -name "*.c" ! -name "*.h" ! -name "*.py" -exec chmod +x {} \;
+          echo "Script permissions fixed."
 
       - name: Detect kernel version
         id: kver
         run: |
-          VER=$(grep "^VERSION =" android-kernel/Makefile | awk '{print $3}')
-          PATCH=$(grep "^PATCHLEVEL =" android-kernel/Makefile | awk '{print $3}')
-          SUB=$(grep "^SUBLEVEL =" android-kernel/Makefile | awk '{print $3}')
+          VER=$(grep "^VERSION =" ${{ env.KERNEL_DIR }}/Makefile | awk '{print $3}')
+          PATCH=$(grep "^PATCHLEVEL =" ${{ env.KERNEL_DIR }}/Makefile | awk '{print $3}')
+          SUB=$(grep "^SUBLEVEL =" ${{ env.KERNEL_DIR }}/Makefile | awk '{print $3}')
           echo "Detected kernel version: $VER.$PATCH.$SUB"
           echo "version=$VER.$PATCH.$SUB" >> $GITHUB_OUTPUT
           echo "major=$VER.$PATCH" >> $GITHUB_OUTPUT
@@ -80,7 +97,7 @@ jobs:
 
       - name: Integrate KernelSU
         run: |
-          cd android-kernel
+          cd ${{ env.KERNEL_DIR }}
           KSU_TAG="${{ steps.ksu_info.outputs.ksu_version }}"
           curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s "$KSU_TAG"
           head -5 KernelSU/kernel/Makefile 2>/dev/null || head -5 drivers/kernelsu/Makefile 2>/dev/null
@@ -102,22 +119,9 @@ jobs:
           }
           echo "$HOME/toolchain/clang/bin" >> $GITHUB_PATH
 
-      - name: Apply GPU driver fix (MT6765)
-        run: |
-          TARGET=$(find android-kernel/drivers/gpu -name "mtk_mfgsys.c" 2>/dev/null | head -n 1)
-          if [ -n "$TARGET" ]; then
-            sed -i 's/PVRSRVGetDevicePowerState(ui32RGXDevIdx,/PVRSRVGetDevicePowerState(MTKGetRGXDevNode(),/g' "$TARGET"
-            sed -i 's/MTKWriteBackFreqToRGX(ui32RGXDevIdx,/MTKWriteBackFreqToRGX(MTKGetRGXDevNode(),/g' "$TARGET"
-            sed -i 's/PVRSRVDevicePostClockSpeedChange(ui32RGXDevIdx,/PVRSRVDevicePostClockSpeedChange(MTKGetRGXDevNode(),/g' "$TARGET"
-            sed -i 's/PVRSRVDevicePreClockSpeedChange(ui32RGXDevIdx,/PVRSRVDevicePreClockSpeedChange(MTKGetRGXDevNode(),/g' "$TARGET"
-            echo "GPU fix applied."
-          else
-            echo "mtk_mfgsys.c not found - skipping."
-          fi
-
       - name: Configure kernel
         run: |
-          cd android-kernel
+          cd ${{ env.KERNEL_DIR }}
           export PATH=$HOME/toolchain/clang/bin:$PATH
 
           DEFCONFIG=$(find arch/arm64/configs -name "*a04s*" -o -name "*a04*defconfig" 2>/dev/null | head -1 | xargs -r basename)
@@ -125,14 +129,14 @@ jobs:
           echo "Using defconfig: $DEFCONFIG"
           echo "DEFCONFIG=$DEFCONFIG" >> $GITHUB_ENV
 
-          make O=out ARCH=arm64 CC=clang \
+          make O=${{ env.OUT_DIR }} ARCH=arm64 CC=clang \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             "$DEFCONFIG"
 
-          sed -i 's/CONFIG_WERROR=y/CONFIG_WERROR=n/g' out/.config
+          sed -i 's/CONFIG_WERROR=y/CONFIG_WERROR=n/g' ${{ env.OUT_DIR }}/.config
 
-          scripts/config --file out/.config \
+          scripts/config --file ${{ env.OUT_DIR }}/.config \
             -e CONFIG_KSU \
             -e CONFIG_KPROBES \
             -e CONFIG_HAVE_KPROBES \
@@ -141,11 +145,11 @@ jobs:
             -e CONFIG_BUILD_ARM64_APPENDED_DTB_IMAGE \
             -d CONFIG_KSU_DEBUG
 
-          scripts/config --file out/.config \
+          scripts/config --file ${{ env.OUT_DIR }}/.config \
             --set-str CONFIG_LOCALVERSION "-KSU-${{ steps.ksu_info.outputs.ksu_version }}" \
             --disable CONFIG_LOCALVERSION_AUTO
 
-          scripts/config --file out/.config \
+          scripts/config --file ${{ env.OUT_DIR }}/.config \
             --disable CONFIG_DEBUG_INFO \
             --disable CONFIG_DEBUG_INFO_SPLIT \
             --disable CONFIG_DEBUG_INFO_REDUCED \
@@ -155,17 +159,17 @@ jobs:
             --enable CONFIG_STRIP_ASM_SYMS \
             --enable CONFIG_CC_OPTIMIZE_FOR_SIZE
 
-          make O=out ARCH=arm64 CC=clang \
+          make O=${{ env.OUT_DIR }} ARCH=arm64 CC=clang \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             olddefconfig
 
       - name: Compile kernel
         run: |
-          cd android-kernel
+          cd ${{ env.KERNEL_DIR }}
           export PATH=$HOME/toolchain/clang/bin:$PATH
 
-          make -j$(nproc --all) O=out ARCH=arm64 \
+          make -j$(nproc --all) O=${{ env.OUT_DIR }} ARCH=arm64 \
             CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm \
             OBJCOPY=llvm-objcopy STRIP=llvm-strip \
             LLVM=1 LLVM_IAS=1 \
@@ -175,19 +179,19 @@ jobs:
             KCFLAGS="-w" \
             Image dtbs 2>&1 | tee $GITHUB_WORKSPACE/compile.log
 
-          if [ ! -f out/arch/arm64/boot/Image ]; then
+          if [ ! -f ${{ env.OUT_DIR }}/arch/arm64/boot/Image ]; then
             echo "::error::Build failed - kernel Image not found!"
             exit 1
           fi
-          echo "Build successful! Size: $(du -h out/arch/arm64/boot/Image | cut -f1)"
+          echo "Build successful! Size: $(du -h ${{ env.OUT_DIR }}/arch/arm64/boot/Image | cut -f1)"
 
       - name: Collect DTBs
         run: |
-          find android-kernel/out/arch/arm64/boot/dts -name "*.dtb" 2>/dev/null \
-            | sort | xargs cat > android-kernel/out/arch/arm64/boot/dtb.img 2>/dev/null || true
-          if [ -s android-kernel/out/arch/arm64/boot/dtb.img ]; then
+          find ${{ env.OUT_DIR }}/arch/arm64/boot/dts -name "*.dtb" 2>/dev/null \
+            | sort | xargs cat > ${{ env.OUT_DIR }}/arch/arm64/boot/dtb.img 2>/dev/null || true
+          if [ -s ${{ env.OUT_DIR }}/arch/arm64/boot/dtb.img ]; then
             echo "HAS_DTB=true" >> $GITHUB_ENV
-            echo "DTB size: $(du -h android-kernel/out/arch/arm64/boot/dtb.img | cut -f1)"
+            echo "DTB size: $(du -h ${{ env.OUT_DIR }}/arch/arm64/boot/dtb.img | cut -f1)"
           else
             echo "HAS_DTB=false" >> $GITHUB_ENV
             echo "No DTBs found."
@@ -235,15 +239,15 @@ jobs:
 
       - name: Package with AnyKernel3
         run: |
-          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 AnyKernel3
-          cd AnyKernel3
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 $GITHUB_WORKSPACE/AnyKernel3
+          cd $GITHUB_WORKSPACE/AnyKernel3
           rm -rf .git .github *.md
 
-          cp $GITHUB_WORKSPACE/android-kernel/out/arch/arm64/boot/Image ./
+          cp ${{ env.OUT_DIR }}/arch/arm64/boot/Image ./
           cp $GITHUB_WORKSPACE/ak3out/anykernel.sh ./
 
           if [ "$HAS_DTB" = "true" ]; then
-            cp $GITHUB_WORKSPACE/android-kernel/out/arch/arm64/boot/dtb.img ./
+            cp ${{ env.OUT_DIR }}/arch/arm64/boot/dtb.img ./
             echo "DTB included."
           fi
 
@@ -256,8 +260,8 @@ jobs:
 
       - name: Verify zip contents
         run: |
-          unzip -l "$GITHUB_WORKSPACE/$ZIP_NAME"
-          unzip -l "$GITHUB_WORKSPACE/$ZIP_NAME" | grep -q "Image" \
+          unzip -l "$GITHUB_WORKSPACE/${{ env.ZIP_NAME }}"
+          unzip -l "$GITHUB_WORKSPACE/${{ env.ZIP_NAME }}" | grep -q "Image" \
             && echo "Image present - OK" \
             || { echo "::error::Image missing from zip!"; exit 1; }
 
