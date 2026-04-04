@@ -53,7 +53,6 @@ jobs:
             -b ${{ github.event.inputs.kernel_branch }} \
             ${{ github.event.inputs.kernel_source }} \
             android-kernel
-          echo "Kernel source cloned. Top-level files:"
           ls android-kernel/
 
       - name: Detect kernel version
@@ -79,27 +78,23 @@ jobs:
             echo "ksu_version=$TAG" >> $GITHUB_OUTPUT
           fi
 
-      - name: Integrate KernelSU via setup.sh
+      - name: Integrate KernelSU
         run: |
           cd android-kernel
           KSU_TAG="${{ steps.ksu_info.outputs.ksu_version }}"
-          echo "Integrating KernelSU $KSU_TAG ..."
           curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s "$KSU_TAG"
-          echo "--- KernelSU Makefile header ---"
           head -5 KernelSU/kernel/Makefile 2>/dev/null || head -5 drivers/kernelsu/Makefile 2>/dev/null
 
-      - name: Setup Clang toolchain
+      - name: Setup Clang 17
         run: |
           mkdir -p $HOME/toolchain/clang
-          echo "Downloading ZyCromerZ Clang 17..."
-          wget -q --show-progress \
+          wget -q \
             https://github.com/ZyCromerZ/Clang/releases/download/17.0.0-20230725-release/Clang-17.0.0-x86_64.tar.gz \
             -O /tmp/clang.tar.gz \
           && tar -xzf /tmp/clang.tar.gz -C $HOME/toolchain/clang/ \
           && rm /tmp/clang.tar.gz \
-          && echo "Clang ready" \
           || {
-            echo "Download failed - falling back to system clang"
+            echo "Clang download failed, using system clang"
             mkdir -p $HOME/toolchain/clang/bin
             for b in clang clang++ ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-strip; do
               [ -f "/usr/bin/$b" ] && ln -sf "/usr/bin/$b" "$HOME/toolchain/clang/bin/$b"
@@ -109,17 +104,15 @@ jobs:
 
       - name: Apply GPU driver fix (MT6765)
         run: |
-          cd android-kernel
-          TARGET=$(find drivers/gpu -name "mtk_mfgsys.c" 2>/dev/null | head -n 1)
+          TARGET=$(find android-kernel/drivers/gpu -name "mtk_mfgsys.c" 2>/dev/null | head -n 1)
           if [ -n "$TARGET" ]; then
-            echo "Applying MT6765 GPU fix to $TARGET"
             sed -i 's/PVRSRVGetDevicePowerState(ui32RGXDevIdx,/PVRSRVGetDevicePowerState(MTKGetRGXDevNode(),/g' "$TARGET"
             sed -i 's/MTKWriteBackFreqToRGX(ui32RGXDevIdx,/MTKWriteBackFreqToRGX(MTKGetRGXDevNode(),/g' "$TARGET"
             sed -i 's/PVRSRVDevicePostClockSpeedChange(ui32RGXDevIdx,/PVRSRVDevicePostClockSpeedChange(MTKGetRGXDevNode(),/g' "$TARGET"
             sed -i 's/PVRSRVDevicePreClockSpeedChange(ui32RGXDevIdx,/PVRSRVDevicePreClockSpeedChange(MTKGetRGXDevNode(),/g' "$TARGET"
             echo "GPU fix applied."
           else
-            echo "mtk_mfgsys.c not found - skipping GPU fix."
+            echo "mtk_mfgsys.c not found - skipping."
           fi
 
       - name: Configure kernel
@@ -159,15 +152,13 @@ jobs:
             --disable CONFIG_DEBUG_INFO_DWARF4 \
             --disable CONFIG_FTRACE \
             --disable CONFIG_PROFILING \
-            --enable  CONFIG_STRIP_ASM_SYMS \
-            --enable  CONFIG_CC_OPTIMIZE_FOR_SIZE
+            --enable CONFIG_STRIP_ASM_SYMS \
+            --enable CONFIG_CC_OPTIMIZE_FOR_SIZE
 
           make O=out ARCH=arm64 CC=clang \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             olddefconfig
-
-          echo "Configuration complete."
 
       - name: Compile kernel
         run: |
@@ -175,12 +166,8 @@ jobs:
           export PATH=$HOME/toolchain/clang/bin:$PATH
 
           make -j$(nproc --all) O=out ARCH=arm64 \
-            CC=clang \
-            LD=ld.lld \
-            AR=llvm-ar \
-            NM=llvm-nm \
-            OBJCOPY=llvm-objcopy \
-            STRIP=llvm-strip \
+            CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm \
+            OBJCOPY=llvm-objcopy STRIP=llvm-strip \
             LLVM=1 LLVM_IAS=1 \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
@@ -192,52 +179,59 @@ jobs:
             echo "::error::Build failed - kernel Image not found!"
             exit 1
           fi
-          echo "Build successful! Image size: $(du -h out/arch/arm64/boot/Image | cut -f1)"
+          echo "Build successful! Size: $(du -h out/arch/arm64/boot/Image | cut -f1)"
 
       - name: Collect DTBs
         run: |
-          cd android-kernel
-          find out/arch/arm64/boot/dts -name "*.dtb" 2>/dev/null | sort | xargs cat > out/arch/arm64/boot/dtb.img 2>/dev/null || true
-          if [ -s out/arch/arm64/boot/dtb.img ]; then
-            echo "DTB collected: $(du -h out/arch/arm64/boot/dtb.img | cut -f1)"
+          find android-kernel/out/arch/arm64/boot/dts -name "*.dtb" 2>/dev/null \
+            | sort | xargs cat > android-kernel/out/arch/arm64/boot/dtb.img 2>/dev/null || true
+          if [ -s android-kernel/out/arch/arm64/boot/dtb.img ]; then
             echo "HAS_DTB=true" >> $GITHUB_ENV
+            echo "DTB size: $(du -h android-kernel/out/arch/arm64/boot/dtb.img | cut -f1)"
           else
-            echo "No DTBs found - skipping DTB packaging."
             echo "HAS_DTB=false" >> $GITHUB_ENV
+            echo "No DTBs found."
           fi
 
       - name: Write anykernel.sh
         run: |
           mkdir -p $GITHUB_WORKSPACE/ak3out
-          cat > $GITHUB_WORKSPACE/ak3out/anykernel.sh << 'AKEOF'
-# AnyKernel3 Ramdisk Mod Script
-# Samsung Galaxy A04s (SM-A047F) + KernelSU
-properties() { '
-kernel.string=Samsung A04s KernelSU Kernel
-do.devicecheck=1
-do.modules=0
-do.systemless=1
-do.cleanup=1
-do.cleanuponabort=1
-device.name1=a04s
-device.name2=a047f
-device.name3=SM-A047F
-device.name4=a047fxxu
-device.name5=a047x
-supported.versions=12-14
-supported.patchlevels=
-'; }
-block=auto;
-is_slot_device=0;
-ramdisk_compression=auto;
-patch_vbmeta_flag=auto;
-. tools/ak3-core.sh;
-split_boot;
-if [ -f "$AKHOME/dtb.img" ]; then
-  flash_dtb;
-fi
-flash_boot;
-AKEOF
+          python3 - <<'PYEOF'
+          import os
+          lines = [
+            "# AnyKernel3 Ramdisk Mod Script\n",
+            "# Samsung Galaxy A04s (SM-A047F) + KernelSU\n",
+            "properties() { '\n",
+            "kernel.string=Samsung A04s KernelSU Kernel\n",
+            "do.devicecheck=1\n",
+            "do.modules=0\n",
+            "do.systemless=1\n",
+            "do.cleanup=1\n",
+            "do.cleanuponabort=1\n",
+            "device.name1=a04s\n",
+            "device.name2=a047f\n",
+            "device.name3=SM-A047F\n",
+            "device.name4=a047fxxu\n",
+            "device.name5=a047x\n",
+            "supported.versions=12-14\n",
+            "supported.patchlevels=\n",
+            "'; }\n",
+            "block=auto;\n",
+            "is_slot_device=0;\n",
+            "ramdisk_compression=auto;\n",
+            "patch_vbmeta_flag=auto;\n",
+            ". tools/ak3-core.sh;\n",
+            "split_boot;\n",
+            "if [ -f \"$AKHOME/dtb.img\" ]; then\n",
+            "  flash_dtb;\n",
+            "fi\n",
+            "flash_boot;\n",
+          ]
+          out = os.path.join(os.environ['GITHUB_WORKSPACE'], 'ak3out', 'anykernel.sh')
+          with open(out, 'w') as f:
+            f.writelines(lines)
+          print(f'Written: {out}')
+          PYEOF
 
       - name: Package with AnyKernel3
         run: |
@@ -246,28 +240,25 @@ AKEOF
           rm -rf .git .github *.md
 
           cp $GITHUB_WORKSPACE/android-kernel/out/arch/arm64/boot/Image ./
-          cp $GITHUB_WORKSPACE/ak3out/anykernel.sh ./anykernel.sh
+          cp $GITHUB_WORKSPACE/ak3out/anykernel.sh ./
 
-          if [ "${{ env.HAS_DTB }}" = "true" ]; then
-            cp $GITHUB_WORKSPACE/android-kernel/out/arch/arm64/boot/dtb.img ./dtb.img
-            echo "DTB included in zip."
+          if [ "$HAS_DTB" = "true" ]; then
+            cp $GITHUB_WORKSPACE/android-kernel/out/arch/arm64/boot/dtb.img ./
+            echo "DTB included."
           fi
 
           BUILD_DATE=$(date +%Y%m%d-%H%M)
           KSU_VER="${{ steps.ksu_info.outputs.ksu_version }}"
           ZIP_NAME="SamsungA04s-KernelSU-${KSU_VER}-${BUILD_DATE}.zip"
-
           zip -r9 "$GITHUB_WORKSPACE/$ZIP_NAME" . -x '.git*'
           echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
-          echo "Packaged: $ZIP_NAME ($(du -h $GITHUB_WORKSPACE/$ZIP_NAME | cut -f1))"
+          echo "Packaged $ZIP_NAME ($(du -h $GITHUB_WORKSPACE/$ZIP_NAME | cut -f1))"
 
       - name: Verify zip contents
         run: |
-          ZIP_NAME="${{ env.ZIP_NAME }}"
-          echo "=== ZIP contents ==="
           unzip -l "$GITHUB_WORKSPACE/$ZIP_NAME"
           unzip -l "$GITHUB_WORKSPACE/$ZIP_NAME" | grep -q "Image" \
-            && echo "Image present in zip - OK" \
+            && echo "Image present - OK" \
             || { echo "::error::Image missing from zip!"; exit 1; }
 
       - name: Upload artifact
@@ -289,7 +280,7 @@ AKEOF
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ksu-${{ steps.ksu_info.outputs.ksu_version }}-build${{ github.run_number }}
-          name: "KernelSU ${{ steps.ksu_info.outputs.ksu_version }} - Samsung A04s"
+          name: KernelSU ${{ steps.ksu_info.outputs.ksu_version }} - Samsung A04s
           body: |
             ## Samsung A04s (SM-A047F) Kernel + KernelSU
 
@@ -299,16 +290,16 @@ AKEOF
             | **Kernel version** | `${{ steps.kver.outputs.version }}` |
             | **Kernel source** | [SavedByLight/android_kernel_samsung_a04s](https://github.com/SavedByLight/android_kernel_samsung_a04s) |
             | **Branch** | `${{ github.event.inputs.kernel_branch }}` |
-            | **Build number** | `#${{ github.run_number }}` |
+            | **Build** | `#${{ github.run_number }}` |
 
             ### Flash instructions
-            1. Boot into TWRP / OrangeFox recovery
+            1. Boot into TWRP / OrangeFox
             2. Flash the ZIP
             3. Reboot to system
-            4. Install **KernelSU Manager APK** from the [KernelSU releases page](https://github.com/tiann/KernelSU/releases)
-            5. Open Manager - status should show **Working**
+            4. Install KernelSU Manager APK from https://github.com/tiann/KernelSU/releases
+            5. Open Manager - status should show Working
 
-            > Built automatically via GitHub Actions
+            > Built via GitHub Actions
           files: ${{ env.ZIP_NAME }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
