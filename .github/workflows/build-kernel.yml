@@ -1,4 +1,4 @@
-name: Build Kernel with KernelSU (Samsung A04)
+name: Build Kernel with KernelSU (Samsung A04s)
 
 on:
   workflow_dispatch:
@@ -6,11 +6,11 @@ on:
       kernel_source:
         description: 'Kernel source URL'
         required: true
-        default: 'https://github.com/rsuntkOrgs/kernel_samsung_wingtech'
+        default: 'https://github.com/SavedByLight/android_kernel_samsung_a04s'
       kernel_branch:
         description: 'Kernel branch'
         required: true
-        default: 'a045x'
+        default: 'main'
       kernelsu_tag:
         description: 'KernelSU tag or "main" for latest'
         required: false
@@ -20,10 +20,6 @@ on:
         required: false
         default: false
         type: boolean
-  push:
-    branches: [main]
-    paths:
-      - '.github/workflows/build-kernel.yml'
 
 jobs:
   build:
@@ -56,14 +52,27 @@ jobs:
             -b ${{ github.event.inputs.kernel_branch }} \
             ${{ github.event.inputs.kernel_source }} \
             android-kernel
+          echo "Kernel source cloned. Top-level files:"
+          ls android-kernel/
 
-      - name: Fetch KernelSU version info
+      - name: Detect kernel version
+        id: kver
+        run: |
+          VER=$(grep "^VERSION =" android-kernel/Makefile | awk '{print $3}')
+          PATCH=$(grep "^PATCHLEVEL =" android-kernel/Makefile | awk '{print $3}')
+          SUB=$(grep "^SUBLEVEL =" android-kernel/Makefile | awk '{print $3}')
+          echo "Detected kernel version: $VER.$PATCH.$SUB"
+          echo "version=$VER.$PATCH.$SUB" >> $GITHUB_OUTPUT
+          echo "major=$VER.$PATCH" >> $GITHUB_OUTPUT
+
+      - name: Fetch latest KernelSU version
         id: ksu_info
         run: |
-          TAG=${{ github.event.inputs.kernelsu_tag }}
+          TAG="${{ github.event.inputs.kernelsu_tag }}"
           if [ "$TAG" = "main" ] || [ -z "$TAG" ]; then
-            LATEST=$(curl -s https://api.github.com/repos/tiann/KernelSU/releases/latest | grep '"tag_name"' | cut -d'"' -f4)
-            echo "KernelSU latest release: $LATEST"
+            LATEST=$(curl -s https://api.github.com/repos/tiann/KernelSU/releases/latest \
+              | grep '"tag_name"' | cut -d'"' -f4)
+            echo "Latest KernelSU: $LATEST"
             echo "ksu_version=$LATEST" >> $GITHUB_OUTPUT
           else
             echo "ksu_version=$TAG" >> $GITHUB_OUTPUT
@@ -72,29 +81,28 @@ jobs:
       - name: Integrate KernelSU via setup.sh
         run: |
           cd android-kernel
-          KSU_TAG=${{ steps.ksu_info.outputs.ksu_version }}
-          echo "Integrating KernelSU $KSU_TAG ..."
+          KSU_TAG="${{ steps.ksu_info.outputs.ksu_version }}"
+          echo "Integrating KernelSU $KSU_TAG into kernel ${{ steps.kver.outputs.version }}..."
           curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s "$KSU_TAG"
-          # Verify
-          echo "KernelSU integrated:"
-          head -5 KernelSU/kernel/Makefile || head -5 drivers/kernelsu/Makefile
+          echo "--- KernelSU Makefile header ---"
+          head -5 KernelSU/kernel/Makefile 2>/dev/null || head -5 drivers/kernelsu/Makefile 2>/dev/null
 
       - name: Setup Clang toolchain
         run: |
           mkdir -p $HOME/toolchain/clang
-          # Use a stable Clang from ZyCromerZ (proven for MT6765 / 4.19)
+          echo "Downloading ZyCromerZ Clang 14..."
           wget -q --show-progress \
             https://github.com/ZyCromerZ/Clang/releases/download/14.0.6-20220902-full/Clang-14.0.6-x86_64.tar.gz \
-            -O /tmp/clang.tar.gz || {
-              echo "ZyCromerZ Clang download failed, falling back to system clang"
-              mkdir -p $HOME/toolchain/clang/bin
-              ln -sf /usr/bin/clang $HOME/toolchain/clang/bin/clang
-              ln -sf /usr/bin/ld.lld $HOME/toolchain/clang/bin/ld.lld
-              for t in /usr/bin/llvm-*; do [ -f "$t" ] && ln -sf "$t" $HOME/toolchain/clang/bin/; done
-              exit 0
-            }
-          tar -xzf /tmp/clang.tar.gz -C $HOME/toolchain/clang/
-          rm /tmp/clang.tar.gz
+            -O /tmp/clang.tar.gz && \
+          tar -xzf /tmp/clang.tar.gz -C $HOME/toolchain/clang/ && \
+          rm /tmp/clang.tar.gz && \
+          echo "Clang ready." || {
+            echo "Download failed — falling back to system clang"
+            mkdir -p $HOME/toolchain/clang/bin
+            ln -sf /usr/bin/clang $HOME/toolchain/clang/bin/clang
+            ln -sf /usr/bin/ld.lld $HOME/toolchain/clang/bin/ld.lld
+            for t in /usr/bin/llvm-*; do [ -f "$t" ] && ln -sf "$t" $HOME/toolchain/clang/bin/; done
+          }
           echo "$HOME/toolchain/clang/bin" >> $GITHUB_PATH
 
       - name: Apply GPU driver fix (MT6765)
@@ -102,14 +110,14 @@ jobs:
           cd android-kernel
           TARGET=$(find drivers/gpu -name "mtk_mfgsys.c" 2>/dev/null | head -n 1)
           if [ -n "$TARGET" ]; then
-            echo "Applying GPU fix to $TARGET"
+            echo "Applying MT6765 GPU fix to $TARGET"
             sed -i 's/PVRSRVGetDevicePowerState(ui32RGXDevIdx,/PVRSRVGetDevicePowerState(MTKGetRGXDevNode(),/g' "$TARGET"
             sed -i 's/MTKWriteBackFreqToRGX(ui32RGXDevIdx,/MTKWriteBackFreqToRGX(MTKGetRGXDevNode(),/g' "$TARGET"
             sed -i 's/PVRSRVDevicePostClockSpeedChange(ui32RGXDevIdx,/PVRSRVDevicePostClockSpeedChange(MTKGetRGXDevNode(),/g' "$TARGET"
             sed -i 's/PVRSRVDevicePreClockSpeedChange(ui32RGXDevIdx,/PVRSRVDevicePreClockSpeedChange(MTKGetRGXDevNode(),/g' "$TARGET"
             echo "GPU fix applied."
           else
-            echo "mtk_mfgsys.c not found, skipping GPU fix."
+            echo "mtk_mfgsys.c not found — skipping GPU fix."
           fi
 
       - name: Configure kernel
@@ -117,19 +125,19 @@ jobs:
           cd android-kernel
           export PATH=$HOME/toolchain/clang/bin:$PATH
 
-          # Find defconfig
-          DEFCONFIG=$(find arch/arm64/configs -name "a04*defconfig" -o -name "*a045*" 2>/dev/null | head -1 | xargs basename)
+          # Auto-detect defconfig
+          DEFCONFIG=$(find arch/arm64/configs -name "*a04s*" -o -name "*a04*defconfig" 2>/dev/null | head -1 | xargs basename 2>/dev/null)
           if [ -z "$DEFCONFIG" ]; then
             DEFCONFIG="a04_defconfig"
           fi
           echo "Using defconfig: $DEFCONFIG"
 
-          make O=out ARCH=arm64 $DEFCONFIG
+          make O=out ARCH=arm64 "$DEFCONFIG"
 
-          # Disable Werror to avoid upstream warnings killing the build
+          # Silence Werror — treats upstream warnings as errors and aborts build
           sed -i 's/CONFIG_WERROR=y/CONFIG_WERROR=n/g' out/.config
 
-          # KernelSU — enable + keep KPROBES on for 4.19 non-GKI hook method
+          # KernelSU — KPROBES required for non-GKI hook method on 4.x kernels
           scripts/config --file out/.config \
             -e CONFIG_KSU \
             -e CONFIG_KPROBES \
@@ -137,12 +145,12 @@ jobs:
             -e CONFIG_OVERLAY_FS \
             -e CONFIG_BUILD_ARM64_APPENDED_DTB_IMAGE
 
-          # Build identity
+          # Embed KSU version into kernel local version string
           scripts/config --file out/.config \
             --set-str CONFIG_LOCALVERSION "-KSU-${{ steps.ksu_info.outputs.ksu_version }}" \
             --disable CONFIG_LOCALVERSION_AUTO
 
-          # Strip debug info to shrink image size
+          # Strip debug info to keep Image size manageable
           scripts/config --file out/.config \
             --disable CONFIG_DEBUG_INFO \
             --disable CONFIG_DEBUG_INFO_SPLIT \
@@ -153,7 +161,7 @@ jobs:
             --enable  CONFIG_STRIP_ASM_SYMS \
             --enable  CONFIG_CC_OPTIMIZE_FOR_SIZE
 
-          echo "Configuration done."
+          echo "Configuration complete."
 
       - name: Compile kernel
         run: |
@@ -175,12 +183,11 @@ jobs:
             Image 2>&1 | tee $GITHUB_WORKSPACE/compile.log
 
           if [ ! -f out/arch/arm64/boot/Image ]; then
-            echo "::error::Kernel Image not found after build!"
+            echo "::error::Build failed — kernel Image not found!"
             exit 1
           fi
 
-          SIZE=$(du -h out/arch/arm64/boot/Image | cut -f1)
-          echo "Kernel Image size: $SIZE"
+          echo "Build successful! Image size: $(du -h out/arch/arm64/boot/Image | cut -f1)"
 
       - name: Package with AnyKernel3
         run: |
@@ -192,15 +199,15 @@ jobs:
 
           cat > anykernel.sh << 'AKEOF'
           properties() {
-            kernel.string=Samsung A04 + KernelSU
+            kernel.string=Samsung A04s + KernelSU
             do.devicecheck=1
             do.modules=0
             do.cleanup=1
             do.cleanuponabort=1
-            device.name1=a04
-            device.name2=a045f
-            device.name3=SM-A045F
-            device.name4=a045x
+            device.name1=a04s
+            device.name2=a047f
+            device.name3=SM-A047F
+            device.name4=a047x
             supported.versions=12-14
           }
 
@@ -215,10 +222,9 @@ jobs:
 
           BUILD_DATE=$(date +%Y%m%d-%H%M)
           KSU_VER=${{ steps.ksu_info.outputs.ksu_version }}
-          ZIP_NAME="SamsungA04-KernelSU-${KSU_VER}-${BUILD_DATE}.zip"
+          ZIP_NAME="SamsungA04s-KernelSU-${KSU_VER}-${BUILD_DATE}.zip"
 
           zip -r9 $GITHUB_WORKSPACE/$ZIP_NAME . -x '.git*'
-
           echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
           echo "Packaged: $ZIP_NAME ($(du -h $GITHUB_WORKSPACE/$ZIP_NAME | cut -f1))"
 
@@ -241,14 +247,15 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ksu-${{ steps.ksu_info.outputs.ksu_version }}-build${{ github.run_number }}
-          name: "KernelSU ${{ steps.ksu_info.outputs.ksu_version }} — Samsung A04"
+          name: "KernelSU ${{ steps.ksu_info.outputs.ksu_version }} — Samsung A04s"
           body: |
-            ## Samsung A04 (SM-A045F) Kernel + KernelSU
+            ## Samsung A04s (SM-A047F) Kernel + KernelSU
 
             | | |
             |---|---|
             | **KernelSU version** | `${{ steps.ksu_info.outputs.ksu_version }}` |
-            | **Kernel source** | `${{ github.event.inputs.kernel_source }}` |
+            | **Kernel version** | `${{ steps.kver.outputs.version }}` |
+            | **Kernel source** | [SavedByLight/android_kernel_samsung_a04s](https://github.com/SavedByLight/android_kernel_samsung_a04s) |
             | **Branch** | `${{ github.event.inputs.kernel_branch }}` |
             | **Build number** | `#${{ github.run_number }}` |
 
