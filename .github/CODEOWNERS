@@ -1,0 +1,8 @@
+# Global owner — all files
+* @casper-justus
+
+# Kernel workflow
+.github/workflows/ @casper-justus
+
+# Device configs and defconfigs
+configs/ @casper-justus
